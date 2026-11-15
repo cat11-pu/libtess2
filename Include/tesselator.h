@@ -114,7 +114,6 @@ enum TessElementType
 	TESS_BOUNDARY_CONTOURS,
 };
 
-
 // TESS_CONSTRAINED_DELAUNAY_TRIANGULATION
 //   If enabled, the initial triagulation is improved with non-robust Constrained Delayney triangulation.
 //   Disable by default.
@@ -137,6 +136,83 @@ typedef struct TESSalloc TESSalloc;
 #define TESS_UNDEF (~(TESSindex)0)
 
 #define TESS_NOTUSED(v) do { (void)(1 ? (void)0 : ( (void)(v) ) ); } while(0)
+
+// TessContourRole classifies each contour passed to tessAddContour(), in the
+// order the contours were added. A contour added while TESS_REVERSE_CONTOURS
+// is enabled (the hole convention) is classified as a hole, otherwise as an
+// outer contour; a zero-area projected contour is degenerate. The index used
+// by tessGetContourCount() matches the 0-based tessAddContour() call order.
+enum TessContourRole
+{
+	// Closed contour with a positive signed area (counter-clockwise on the
+	// tessellation plane under the default winding convention). These are the
+	// outer boundaries of a region.
+	TESS_CONTOUR_OUTER = 1,
+	// Closed contour with a negative signed area (clockwise on the
+	// tessellation plane), i.e. added with TESS_REVERSE_CONTOURS. These are
+	// holes cut out of an outer contour.
+	TESS_CONTOUR_HOLE = -1,
+	// Contour whose projected area is zero (degenerate, e.g. a line or point).
+	// Such a contour never bounds any output triangle.
+	TESS_CONTOUR_DEGENERATE = 0,
+};
+
+// TessWindingDirection reports the orientation of an output triangle on the
+// tessellation plane. All non-degenerate triangles produced by a single
+// tessTesselate() call share the same direction.
+enum TessWindingDirection
+{
+	// Counter-clockwise (positive signed area on the tessellation plane).
+	TESS_WINDING_CCW = 1,
+	// Clockwise (negative signed area on the tessellation plane).
+	TESS_WINDING_CW = -1,
+	// Degenerate triangle with zero area; not emitted as a fillable element.
+	TESS_WINDING_FLAT = 0,
+};
+
+// TESSContourInfo describes one input contour, indexed by the order in which
+// it was passed to tessAddContour(). Every tessAddContour() call produces
+// exactly one entry, even when the contour is degenerate or invalid.
+typedef struct TESSContourInfo
+{
+	// One of TessContourRole.
+	int role;
+	// Signed area of the contour projected onto the tessellation plane
+	// (shoelace formula). The projection normalisation may flip the sign of
+	// every contour together, so this value is intended for magnitude/metric
+	// use; 'role' is the authoritative outer/hole classification.
+	TESSreal signedArea;
+	// Number of vertices supplied to tessAddContour() for this contour.
+	int vertexCount;
+} TESSContourInfo;
+
+// TESStriangleInfo is the per-triangle attribution record. One record is
+// returned for each triangle element, in the same order as tessGetElements().
+// This requires tessTesselate() with TESS_POLYGONS and polySize == 3; for any
+// other element type tessGetTriangleInfoCount() returns 0.
+//
+// The array is only valid while the tesselator output is valid, i.e. until the
+// next tessTesselate(), tessAddContour() or tessDeleteTess() call.
+typedef struct TESStriangleInfo
+{
+	// Index of the outer contour (tessAddContour() call order) whose filled
+	// region contains this triangle. TESS_UNDEF for a triangle that cannot be
+	// attributed to a single outer contour (e.g. an overlap region fed by
+	// several outer contours under TESS_WINDING_NONZERO / TESS_WINDING_ODD).
+	TESSindex outerContour;
+	// Index of the hole contour adjacent to this triangle, or TESS_UNDEF when
+	// the triangle does not touch a hole. When a triangle borders several
+	// holes (possible only at a shared pinch point), this convenience field
+	// holds the first one; inspect edgeContours for the complete picture.
+	TESSindex holeContour;
+	// Contour index for each of the triangle's three edges, aligned with the
+	// vertex order of the element array (edge i runs from vertex i to vertex
+	// (i+1)%3). TESS_UNDEF means the edge is an internal triangulation edge or
+	// an intersection-generated edge not owned by a single input contour.
+	TESSindex edgeContours[3];
+	// One of TessWindingDirection; identical for every record of a run.
+	int winding;
+} TESStriangleInfo;
 
 // These two constants define the valid input coordinate range the library is
 // able to operate on. Tesselation will fail if any of the coordinates are not
@@ -243,6 +319,28 @@ int tessGetElementCount( TESStesselator *tess );
 
 // tessGetElements() - Returns pointer to the first element.
 const TESSindex* tessGetElements( TESStesselator *tess );
+
+// tessGetContourCount() - Returns the number of contours added with
+// tessAddContour(). Contour indices used by TESStriangleInfo range from
+// 0 to tessGetContourCount()-1 and match the tessAddContour() call order.
+int tessGetContourCount( TESStesselator *tess );
+
+// tessGetContours() - Returns one TESSContourInfo per input contour, in
+// tessAddContour() order, or NULL when no contours have been added. The role
+// and signed area fields are populated by tessTesselate(); before that call
+// role is TESS_CONTOUR_DEGENERATE and signedArea is zero.
+const TESSContourInfo* tessGetContours( TESStesselator *tess );
+
+// tessGetTriangleInfoCount() - Returns the number of TESStriangleInfo records,
+// which equals tessGetElementCount() for a triangulation requested with
+// TESS_POLYGONS and polySize == 3. Returns 0 for other element types, when no
+// tessellation has been run, or when it failed.
+int tessGetTriangleInfoCount( TESStesselator *tess );
+
+// tessGetTriangleInfo() - Returns per-triangle contour/hole/winding
+// attribution, one record per triangle in tessGetElements() order, or NULL
+// when tessGetTriangleInfoCount() is 0.
+const TESStriangleInfo* tessGetTriangleInfo( TESStesselator *tess );
 
 typedef enum TESSstatus {
   TESS_STATUS_OK,

@@ -79,6 +79,13 @@ struct TESStesselator {
 	TESSindex *elements;
 	int elementCount;
 
+	/*** per-contour bookkeeping and per-triangle attribution ***/
+	TESSContourInfo *contours;
+	TESShalfEdge **contourEdges;
+	int contourCount;
+	TESStriangleInfo *triangleInfo;
+	int triangleInfoCount;
+
 	TESSalloc alloc;
 
 	jmp_buf env;			/* place to jump to when memAllocs fail */

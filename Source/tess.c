@@ -658,6 +658,11 @@ TESStesselator* tessNewTess( TESSalloc* alloc )
 	tess->vertexCount = 0;
 	tess->elements = 0;
 	tess->elementCount = 0;
+	tess->contours = 0;
+	tess->contourEdges = 0;
+	tess->contourCount = 0;
+	tess->triangleInfo = 0;
+	tess->triangleInfoCount = 0;
 
 	return tess;
 }
@@ -685,6 +690,18 @@ void tessDeleteTess( TESStesselator *tess )
 		alloc.memfree( alloc.userData, tess->elements );
 		tess->elements = 0;
 	}
+	if (tess->contours != NULL) {
+		alloc.memfree( alloc.userData, tess->contours );
+		tess->contours = 0;
+	}
+	if (tess->contourEdges != NULL) {
+		alloc.memfree( alloc.userData, tess->contourEdges );
+		tess->contourEdges = 0;
+	}
+	if (tess->triangleInfo != NULL) {
+		alloc.memfree( alloc.userData, tess->triangleInfo );
+		tess->triangleInfo = 0;
+	}
 
 	alloc.memfree( alloc.userData, tess );
 }
@@ -697,6 +714,219 @@ static TESSindex GetNeighbourFace(TESShalfEdge* edge)
 	if (!edge->Rface->inside)
 		return TESS_UNDEF;
 	return edge->Rface->n;
+}
+
+/* Signed area of a closed contour on the tessellation (s,t) plane. The sign
+* follows the stored half-edge loop direction. */
+static TESSreal ContourSignedArea( TESShalfEdge *edge )
+{
+	TESShalfEdge *start = edge;
+	TESSreal area = 0;
+	if ( edge == NULL ) return 0;
+	do {
+		area += edge->Org->s * edge->Dst->t - edge->Dst->s * edge->Org->t;
+		edge = edge->Lnext;
+	} while ( edge != start );
+	return area * (TESSreal)0.5;
+}
+
+/* Classifies the input contours after projection so the role and signed area
+* are expressed on the same plane the triangulation is emitted on. */
+static void ClassifyContours( TESStesselator *tess )
+{
+	int i;
+	for ( i = 0; i < tess->contourCount; ++i )
+	{
+		TESShalfEdge *edge = tess->contourEdges[i];
+		TESSreal area = ContourSignedArea( edge );
+		/* The projection pass (CheckOrientation) may flip every t coordinate,
+		* so the projected area sign cannot distinguish an outer loop from a
+		* hole. The input half-edge winding carries that semantics directly:
+		* tessAddContour() assigns +1 to a forward contour and -1 when
+		* TESS_REVERSE_CONTOURS is set, which is exactly the outer/hole
+		* convention used by the winding rules. */
+		int windingSign = ( edge != NULL && edge->winding < 0 ) ? -1 : 1;
+		tess->contours[i].signedArea = area;
+		if ( edge == NULL || area == 0 )
+			tess->contours[i].role = TESS_CONTOUR_DEGENERATE;
+		else if ( windingSign > 0 )
+			tess->contours[i].role = TESS_CONTOUR_OUTER;
+		else
+			tess->contours[i].role = TESS_CONTOUR_HOLE;
+	}
+}
+
+static TESSindex BoundaryContour( TESShalfEdge *edge )
+{
+	if ( EdgeIsInternal( edge ) )
+		return TESS_UNDEF;
+	return edge->contour;
+}
+
+/* Builds one TESStriangleInfo per inside face. The mesh at this point has
+* already been triangulated (and optionally Delaunay-refined) but faces have
+* not yet been renumbered, so face->n is assigned here in the same traversal
+* order used later by OutputPolymesh(). */
+static void BuildTriangleInfo( TESStesselator *tess, TESSmesh *mesh )
+{
+	TESSface *f;
+	TESShalfEdge *edge;
+	TESStriangleInfo *info;
+	TESSface **queue;
+	TESSindex *outerMap;
+	TESSindex *holeMap;
+	int faceCount = 0;
+	int head, tail;
+	int i;
+
+	for ( f = mesh->fHead.next; f != &mesh->fHead; f = f->next )
+	{
+		if ( f->inside )
+		{
+			/* f->n is reused as a dense inside-face index. OutputPolymesh()
+			* renumbers every face afterwards, so this does not escape. */
+			f->n = faceCount;
+			++faceCount;
+		}
+	}
+
+	tess->triangleInfoCount = faceCount;
+	if ( faceCount == 0 )
+	{
+		tess->triangleInfo = NULL;
+		return;
+	}
+
+	tess->triangleInfo = (TESStriangleInfo*)tess->alloc.memalloc(
+		tess->alloc.userData, sizeof(TESStriangleInfo) * faceCount );
+	queue = (TESSface**)tess->alloc.memalloc(
+		tess->alloc.userData, sizeof(TESSface*) * faceCount );
+	outerMap = (TESSindex*)tess->alloc.memalloc(
+		tess->alloc.userData, sizeof(TESSindex) * faceCount );
+	holeMap = (TESSindex*)tess->alloc.memalloc(
+		tess->alloc.userData, sizeof(TESSindex) * faceCount );
+	if ( tess->triangleInfo == NULL || queue == NULL ||
+	     outerMap == NULL || holeMap == NULL )
+	{
+		if ( tess->triangleInfo != NULL )
+			tess->alloc.memfree( tess->alloc.userData, tess->triangleInfo );
+		if ( queue != NULL )
+			tess->alloc.memfree( tess->alloc.userData, queue );
+		if ( outerMap != NULL )
+			tess->alloc.memfree( tess->alloc.userData, outerMap );
+		if ( holeMap != NULL )
+			tess->alloc.memfree( tess->alloc.userData, holeMap );
+		tess->triangleInfo = NULL;
+		tess->triangleInfoCount = 0;
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
+		return;
+	}
+
+	for ( f = mesh->fHead.next; f != &mesh->fHead; f = f->next )
+	{
+		f->marked = FALSE;
+	}
+
+	/* Pass 1: per-face boundary evidence. Every edge touching an outer
+	* contour seeds that face's outerContour; hole edges record holeContour. */
+	for ( f = mesh->fHead.next; f != &mesh->fHead; f = f->next )
+	{
+		TESSindex outer = TESS_UNDEF;
+		TESSindex hole = TESS_UNDEF;
+		if ( !f->inside ) continue;
+
+		edge = f->anEdge;
+		do {
+			TESSindex contourId = BoundaryContour( edge );
+			if ( contourId != TESS_UNDEF && contourId < tess->contourCount )
+			{
+				if ( tess->contours[contourId].role == TESS_CONTOUR_OUTER )
+					outer = contourId;
+				else if ( tess->contours[contourId].role == TESS_CONTOUR_HOLE &&
+				          hole == TESS_UNDEF )
+					hole = contourId;
+			}
+			edge = edge->Lnext;
+		} while ( edge != f->anEdge );
+
+		outerMap[f->n] = outer;
+		holeMap[f->n] = hole;
+	}
+
+	/* Pass 2: flood-fill outerContour across internal edges so deep interior
+	* triangles inherit the outer boundary of the region they belong to. */
+	head = 0;
+	tail = 0;
+	for ( f = mesh->fHead.next; f != &mesh->fHead; f = f->next )
+	{
+		if ( f->inside && outerMap[f->n] != TESS_UNDEF )
+		{
+			f->marked = TRUE;
+			queue[tail++] = f;
+		}
+	}
+
+	while ( head < tail )
+	{
+		TESSface *cur = queue[head++];
+		edge = cur->anEdge;
+		do {
+			TESSface *neighbor = edge->Rface;
+			if ( neighbor && neighbor->inside && !neighbor->marked )
+			{
+				neighbor->marked = TRUE;
+				outerMap[neighbor->n] = outerMap[cur->n];
+				queue[tail++] = neighbor;
+			}
+			edge = edge->Lnext;
+		} while ( edge != cur->anEdge );
+	}
+
+	/* Pass 3: emit records in face order, including winding and edge tags. */
+	info = tess->triangleInfo;
+	for ( f = mesh->fHead.next; f != &mesh->fHead; f = f->next )
+	{
+		TESSreal area2;
+		TESSreal sx, sy, tx, ty;
+		if ( !f->inside ) continue;
+
+		info->outerContour = outerMap[f->n];
+		info->holeContour = holeMap[f->n];
+
+		edge = f->anEdge;
+		for ( i = 0; i < 3; ++i )
+		{
+			info->edgeContours[i] = BoundaryContour( edge );
+			edge = edge->Lnext;
+		}
+
+		/* Signed area doubled, on the projected tessellation plane. */
+		edge = f->anEdge;
+		sx = edge->Org->s;
+		sy = edge->Org->t;
+		area2 = 0;
+		do {
+			tx = edge->Dst->s;
+			ty = edge->Dst->t;
+			area2 += sx * ty - tx * sy;
+			sx = tx;
+			sy = ty;
+			edge = edge->Lnext;
+		} while ( edge != f->anEdge );
+
+		if ( area2 > 0 )
+			info->winding = TESS_WINDING_CCW;
+		else if ( area2 < 0 )
+			info->winding = TESS_WINDING_CW;
+		else
+			info->winding = TESS_WINDING_FLAT;
+
+		++info;
+	}
+
+	tess->alloc.memfree( tess->alloc.userData, queue );
+	tess->alloc.memfree( tess->alloc.userData, outerMap );
+	tess->alloc.memfree( tess->alloc.userData, holeMap );
 }
 
 void OutputPolymesh( TESStesselator *tess, TESSmesh *mesh, int elementType, int polySize, int vertexSize )
@@ -924,15 +1154,58 @@ int IsValidCoord(TESSreal coord) {
       coord >= TESS_MIN_VALID_INPUT_VALUE;
 }
 
+/* Grows an array by one element using memalloc + copy so allocators that
+* leave memrealloc NULL are supported (mirrors the library convention).
+* Returns the new block and frees the old one; NULL on allocation failure. */
+static void* GrowArray( TESStesselator *tess, void *ptr, int elementSize,
+                        int oldCount )
+{
+	void *newPtr = tess->alloc.memalloc( tess->alloc.userData,
+		(unsigned int)(elementSize * (oldCount + 1)) );
+	if ( newPtr == NULL )
+		return NULL;
+	if ( ptr != NULL && oldCount > 0 )
+	{
+		unsigned char *dst = (unsigned char*)newPtr;
+		const unsigned char *src = (const unsigned char*)ptr;
+		int i;
+		for ( i = 0; i < elementSize * oldCount; ++i )
+			dst[i] = src[i];
+		tess->alloc.memfree( tess->alloc.userData, ptr );
+	}
+	return newPtr;
+}
+
 void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 					int stride, int numVertices )
 {
 	const unsigned char *src = (const unsigned char*)vertices;
 	TESShalfEdge *e;
+	TESShalfEdge *first;
+	TESSContourInfo *newContours;
+	TESShalfEdge **newContourEdges;
 	int i;
 
+	/* Reusing the tesselator after a completed run starts a fresh input set. */
 	if ( tess->mesh == NULL )
+	{
+		if ( tess->contours != NULL ) {
+			tess->alloc.memfree( tess->alloc.userData, tess->contours );
+			tess->contours = NULL;
+		}
+		if ( tess->contourEdges != NULL ) {
+			tess->alloc.memfree( tess->alloc.userData, tess->contourEdges );
+			tess->contourEdges = NULL;
+		}
+		if ( tess->triangleInfo != NULL ) {
+			tess->alloc.memfree( tess->alloc.userData, tess->triangleInfo );
+			tess->triangleInfo = NULL;
+		}
+		tess->contourCount = 0;
+		tess->triangleInfoCount = 0;
+		tess->status = TESS_STATUS_OK;
 	  	tess->mesh = tessMeshNewMesh( &tess->alloc );
+	}
  	if ( tess->mesh == NULL ) {
 		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return;
@@ -943,7 +1216,9 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 	if ( size > 3 )
 		size = 3;
 
-	e = NULL;
+	/* Validate the whole contour before touching the mesh so that a rejected
+	* contour does not leave a partial, unattributed loop behind. */
+	src = (const unsigned char*)vertices;
 	for( i = 0; i < numVertices; ++i )
 	{
 		const TESSreal* coords = (const TESSreal*)src;
@@ -954,6 +1229,31 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 			tess->status = TESS_STATUS_INVALID_INPUT;
 			return;
 		}
+	}
+
+	newContours = (TESSContourInfo*)GrowArray( tess, tess->contours,
+		sizeof(TESSContourInfo), tess->contourCount );
+	if ( newContours == NULL ) {
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
+		return;
+	}
+	tess->contours = newContours;
+
+	newContourEdges = (TESShalfEdge**)GrowArray( tess, tess->contourEdges,
+		sizeof(TESShalfEdge*), tess->contourCount );
+	if ( newContourEdges == NULL ) {
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
+		return;
+	}
+	tess->contourEdges = newContourEdges;
+
+	e = NULL;
+	first = NULL;
+	src = (const unsigned char*)vertices;
+	for( i = 0; i < numVertices; ++i )
+	{
+		const TESSreal* coords = (const TESSreal*)src;
+		src += stride;
 		if( e == NULL ) {
 			/* Make a self-loop (one vertex, one edge). */
 			e = tessMeshMakeEdge( tess->mesh );
@@ -983,6 +1283,15 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 			e->Org->coords[2] = coords[2];
 		else
 			e->Org->coords[2] = 0;
+
+		if( first == NULL )
+			first = e;
+
+		/* Tag the contour edge (both half-edges) so the output pass can
+		* attribute boundary triangles back to this input contour. */
+		e->contour = tess->contourCount;
+		e->Sym->contour = tess->contourCount;
+
 		/* Store the insertion number so that the vertex can be later recognized. */
 		e->Org->idx = tess->vertexIndexCounter++;
 
@@ -994,6 +1303,14 @@ void tessAddContour( TESStesselator *tess, int size, const void* vertices,
         e->winding = tess->reverseContours ? -1 : 1;
         e->Sym->winding = tess->reverseContours ? 1 : -1;
 	}
+
+	/* A contour is always registered, even when empty or degenerate, so the
+	* tessGetContourCount() indices match the tessAddContour() call order. */
+	tess->contours[tess->contourCount].role = TESS_CONTOUR_DEGENERATE;
+	tess->contours[tess->contourCount].signedArea = 0;
+	tess->contours[tess->contourCount].vertexCount = numVertices;
+	tess->contourEdges[tess->contourCount] = first;
+	++tess->contourCount;
 }
 
 void tessSetOption( TESStesselator *tess, int option, int value )
@@ -1028,6 +1345,11 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 		tess->alloc.memfree( tess->alloc.userData, tess->vertexIndices );
 		tess->vertexIndices = 0;
 	}
+	if (tess->triangleInfo != NULL) {
+		tess->alloc.memfree( tess->alloc.userData, tess->triangleInfo );
+		tess->triangleInfo = 0;
+	}
+	tess->triangleInfoCount = 0;
 
 	tess->vertexIndexCounter = 0;
 
@@ -1059,6 +1381,10 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 	* of the polygon.
 	*/
 	tessProjectPolygon( tess );
+
+	/* Recompute contour roles/areas now that every vertex is projected onto
+	* the tessellation plane. */
+	ClassifyContours( tess );
 
 	/* tessComputeInterior( tess ) computes the planar arrangement specified
 	* by the given contours, and further subdivides this arrangement
@@ -1092,6 +1418,10 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 	}
 	else
 	{
+		/* Attribution requires plain triangles; other polygon sizes and
+		* connected polygons leave triangleInfoCount at zero. */
+		if ( elementType == TESS_POLYGONS && polySize == 3 )
+			BuildTriangleInfo( tess, mesh );
 		OutputPolymesh( tess, mesh, elementType, polySize, vertexSize );     /* output polygons */
 	}
 
@@ -1126,8 +1456,27 @@ const int* tessGetElements( TESStesselator *tess )
 	return tess->elements;
 }
 
+int tessGetContourCount( TESStesselator *tess )
+{
+	return tess->contourCount;
+}
+
+const TESSContourInfo* tessGetContours( TESStesselator *tess )
+{
+	return tess->contours;
+}
+
+int tessGetTriangleInfoCount( TESStesselator *tess )
+{
+	return tess->triangleInfoCount;
+}
+
+const TESStriangleInfo* tessGetTriangleInfo( TESStesselator *tess )
+{
+	return tess->triangleInfo;
+}
+
 TESSstatus tessGetStatus( TESStesselator *tess )
 {
 	return tess->status;
 }
-

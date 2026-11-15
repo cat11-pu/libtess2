@@ -144,6 +144,7 @@ struct TESShalfEdge {
 	int winding;    /* change in winding number when crossing
 						  from the right face to the left face */
 	int mark; /* Used by the Edge Flip algorithm */
+	TESSindex contour; /* input contour index (tessAddContour order), or TESS_UNDEF for generated edges */
 };
 
 #define Rface   Sym->Lface

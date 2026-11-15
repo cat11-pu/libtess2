@@ -81,6 +81,7 @@ static TESShalfEdge *MakeEdge( TESSmesh* mesh, TESShalfEdge *eNext )
 	e->winding = 0;
 	e->activeRegion = NULL;
 	e->mark = 0;
+	e->contour = TESS_UNDEF;
 
 	eSym->Sym = e;
 	eSym->Onext = eSym;
@@ -90,6 +91,7 @@ static TESShalfEdge *MakeEdge( TESSmesh* mesh, TESShalfEdge *eNext )
 	eSym->winding = 0;
 	eSym->activeRegion = NULL;
 	eSym->mark = 0;
+	eSym->contour = TESS_UNDEF;
 
 	return e;
 }
@@ -469,6 +471,8 @@ TESShalfEdge *tessMeshSplitEdge( TESSmesh *mesh, TESShalfEdge *eOrg )
 	eNew->Rface = eOrg->Rface;
 	eNew->winding = eOrg->winding;	/* copy old winding information */
 	eNew->Sym->winding = eOrg->Sym->winding;
+	eNew->contour = eOrg->contour;	/* both pieces keep the input contour */
+	eNew->Sym->contour = eOrg->Sym->contour;
 
 	return eNew;
 }
@@ -631,6 +635,7 @@ TESSmesh *tessMeshNewMesh( TESSalloc* alloc )
 	e->Lface = NULL;
 	e->winding = 0;
 	e->activeRegion = NULL;
+	e->contour = TESS_UNDEF;
 
 	eSym->next = eSym;
 	eSym->Sym = e;
@@ -640,6 +645,7 @@ TESSmesh *tessMeshNewMesh( TESSalloc* alloc )
 	eSym->Lface = NULL;
 	eSym->winding = 0;
 	eSym->activeRegion = NULL;
+	eSym->contour = TESS_UNDEF;
 
 	return mesh;
 }
