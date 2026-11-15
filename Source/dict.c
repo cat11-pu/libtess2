@@ -49,6 +49,7 @@ Dict *dictNewDict( TESSalloc* alloc, void *frame, int (*leq)(TESStesselator *fra
 	head->next = head;
 	head->prev = head;
 
+	dict->searchHint = NULL;
 	dict->frame = frame;
 	dict->leq = leq;
 
@@ -92,6 +93,7 @@ DictNode *dictInsertBefore( Dict *dict, DictNode *node, ActiveRegion *key )
 /* really tessDictListDelete */
 void dictDelete( Dict *dict, DictNode *node ) /*ARGSUSED*/
 {
+	if( dict->searchHint == node ) dict->searchHint = NULL;
 	node->next->prev = node->prev;
 	node->prev->next = node->next;
 	bucketFree( dict->nodePool, node );
@@ -100,11 +102,26 @@ void dictDelete( Dict *dict, DictNode *node ) /*ARGSUSED*/
 /* really tessDictListSearch */
 DictNode *dictSearch( Dict *dict, ActiveRegion *key )
 {
-	DictNode *node = &dict->head;
+	DictNode *node = dict->searchHint;
 
-	do {
-		node = node->next;
-	} while( node->key != NULL && ! (*dict->leq)(dict->frame, key, node->key));
+	if( node == NULL || node->key == NULL ) {
+		node = &dict->head;
+		do {
+			node = node->next;
+		} while( node->key != NULL && ! (*dict->leq)(dict->frame, key, node->key));
+	} else if( (*dict->leq)(dict->frame, node->key, key) &&
+			   ! (*dict->leq)(dict->frame, key, node->key) ) {
+		do {
+			node = node->next;
+		} while( node->key != NULL && (*dict->leq)(dict->frame, node->key, key) &&
+				 ! (*dict->leq)(dict->frame, key, node->key));
+	} else {
+		while( node->prev->key != NULL &&
+			   (*dict->leq)(dict->frame, key, node->prev->key) ) {
+			node = node->prev;
+		}
+	}
 
+	dict->searchHint = node;
 	return node;
 }

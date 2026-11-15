@@ -68,6 +68,7 @@ struct DictNode {
 
 struct Dict {
 	DictNode head;
+	DictNode *searchHint;
 	void *frame;
 	struct BucketAlloc *nodePool;
 	int (*leq)(TESStesselator *frame, ActiveRegion *key1, ActiveRegion *key2);

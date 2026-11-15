@@ -32,6 +32,8 @@
 //#include "tesos.h"
 #include <stddef.h>
 #include <assert.h>
+#include <stdint.h>
+#include <string.h>
 #include "../Include/tesselator.h"
 #include "priorityq.h"
 
@@ -336,37 +338,100 @@ void pqDeletePriorityQ( TESSalloc* alloc, PriorityQ *pq )
 #define GT(x,y)     (! LEQ(x,y))
 #define Swap(a,b)   do { PQkey *tmp = *a; *a = *b; *b = tmp; } while (0)
 
-/* really tessPqSortInit */
-int pqInit( TESSalloc* alloc, PriorityQ *pq )
+static uint32_t FloatSortKey( TESSreal value )
+{
+	uint32_t bits;
+
+	memcpy( &bits, &value, sizeof( bits ) );
+	if( (bits & 0x7fffffffU) == 0 ) bits = 0;
+	return (bits & 0x80000000U) ? ~bits : (bits ^ 0x80000000U);
+}
+
+static uint64_t VertexSortKey( PQkey key )
+{
+	TESSvertex *vertex = (TESSvertex *)key;
+	return ((uint64_t)FloatSortKey( vertex->s ) << 32) |
+		(uint64_t)FloatSortKey( vertex->t );
+}
+
+static int CanRadixSort( PriorityQ *pq )
+{
+	int i;
+
+	for( i = 0; i < pq->size; ++i ) {
+		TESSvertex *vertex = (TESSvertex *)*pq->order[i];
+		uint32_t sBits, tBits;
+		memcpy( &sBits, &vertex->s, sizeof( sBits ) );
+		memcpy( &tBits, &vertex->t, sizeof( tBits ) );
+		if( (sBits & 0x7f800000U) == 0x7f800000U ||
+			(tBits & 0x7f800000U) == 0x7f800000U ) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static int RadixSort( TESSalloc *alloc, PriorityQ *pq )
+{
+	const int size = pq->size;
+	PQkey **src = pq->order;
+	PQkey **dst;
+	PQkey **buffer;
+	PQkey **tmp;
+	int shift, i;
+
+	if( size < 2 ) return 1;
+	dst = (PQkey **)alloc->memalloc( alloc->userData,
+		(size_t)(size * sizeof( dst[0] )) );
+	if( dst == NULL ) return 0;
+	buffer = dst;
+
+	for( shift = 0; shift < 64; shift += 8 ) {
+		unsigned int counts[256] = { 0 };
+		unsigned int offset = 0;
+
+		for( i = 0; i < size; ++i ) {
+			++counts[(VertexSortKey( *src[i] ) >> shift) & 0xffU];
+		}
+		for( i = 0; i < 256; ++i ) {
+			unsigned int count = counts[i];
+			counts[i] = offset;
+			offset += count;
+		}
+		for( i = 0; i < size; ++i ) {
+			unsigned int digit = (unsigned int)
+				((VertexSortKey( *src[i] ) >> shift) & 0xffU);
+			dst[counts[digit]++] = src[i];
+		}
+
+		tmp = src;
+		src = dst;
+		dst = tmp;
+	}
+
+	/* The array is stored in descending order so that the end can be
+	* popped in O(1) as the minimum. */
+	for( i = 0, shift = size - 1; i < shift; ++i, --shift ) {
+		PQkey *swap = src[i];
+		src[i] = src[shift];
+		src[shift] = swap;
+	}
+
+	if( src != pq->order ) {
+		memcpy( pq->order, src, (size_t)(size * sizeof( src[0] )) );
+	}
+	alloc->memfree( alloc->userData, buffer );
+	return 1;
+}
+
+static void Quicksort( PriorityQ *pq )
 {
 	PQkey **p, **r, **i, **j, *piv;
 	struct { PQkey **p, **r; } Stack[50], *top = Stack;
 	unsigned int seed = 2016473283;
 
-	/* Create an array of indirect pointers to the keys, so that we
-	* the handles we have returned are still valid.
-	*/
-	/*
-	pq->order = (PQkey **)memAlloc( (size_t)
-	(pq->size * sizeof(pq->order[0])) );
-	*/
-	pq->order = (PQkey **)alloc->memalloc( alloc->userData,
-										  (size_t)((pq->size+1) * sizeof(pq->order[0])) );
-	/* the previous line is a patch to compensate for the fact that IBM */
-	/* machines return a null on a malloc of zero bytes (unlike SGI),   */
-	/* so we have to put in this defense to guard against a memory      */
-	/* fault four lines down. from fossum@austin.ibm.com.               */
-	if (pq->order == NULL) return 0;
-
 	p = pq->order;
 	r = p + pq->size - 1;
-	for( piv = pq->keys, i = p; i <= r; ++piv, ++i ) {
-		*i = piv;
-	}
-
-	/* Sort the indirect pointers in descending order,
-	* using randomized Quicksort
-	*/
 	top->p = p; top->r = r; ++top;
 	while( --top >= Stack ) {
 		p = top->p;
@@ -402,6 +467,39 @@ int pqInit( TESSalloc* alloc, PriorityQ *pq )
 			*j = piv;
 		}
 	}
+}
+
+/* really tessPqSortInit */
+int pqInit( TESSalloc* alloc, PriorityQ *pq )
+{
+	PQkey **p, **r, **i, *piv;
+
+	/* Create an array of indirect pointers to the keys, so that we
+	* the handles we have returned are still valid.
+	*/
+	/*
+	pq->order = (PQkey **)memAlloc( (size_t)
+	(pq->size * sizeof(pq->order[0])) );
+	*/
+	pq->order = (PQkey **)alloc->memalloc( alloc->userData,
+										  (size_t)((pq->size+1) * sizeof(pq->order[0])) );
+	/* the previous line is a patch to compensate for the fact that IBM */
+	/* machines return a null on a malloc of zero bytes (unlike SGI),   */
+	/* so we have to put in this defense to guard against a memory      */
+	/* fault four lines down. from fossum@austin.ibm.com.               */
+	if (pq->order == NULL) return 0;
+
+	p = pq->order;
+	r = p + pq->size - 1;
+	for( piv = pq->keys, i = p; i <= r; ++piv, ++i ) {
+		*i = piv;
+	}
+
+	/* Sort the indirect pointers in descending order. Finite float
+	* coordinates have a total 64-bit order, so use a stable radix sort to
+	* avoid O(n log n) comparisons. Fall back to the existing quicksort when
+	* the projection is not finite. */
+	if( ! CanRadixSort( pq ) || ! RadixSort( alloc, pq ) ) Quicksort( pq );
 	pq->max = pq->size;
 	pq->initialized = TRUE;
 	pqHeapInit( pq->heap );  /* always succeeds */
