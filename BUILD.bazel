@@ -39,3 +39,10 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "libtess2_property_test",
+    size = "medium",
+    srcs = ["Tests/property_test.cc"],
+    deps = [":libtess2"],
+)
