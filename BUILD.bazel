@@ -23,6 +23,8 @@ cc_library(
         "Source/sweep.h",
         "Source/tess.c",
         "Source/tess.h",
+        "Source/validate.c",
+        "Source/validate.h",
     ],
     hdrs = ["Include/tesselator.h"],
     include_prefix = "libtess2",

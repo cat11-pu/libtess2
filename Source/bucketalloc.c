@@ -100,6 +100,8 @@ struct BucketAlloc* createBucketAlloc( TESSalloc* alloc, const char* name,
 									  unsigned int itemSize, unsigned int bucketSize )
 {
 	BucketAlloc* ba = (BucketAlloc*)alloc->memalloc( alloc->userData, sizeof(BucketAlloc) );
+	if ( !ba )
+		return 0;
 
 	ba->alloc = alloc;
 	ba->name = name;
@@ -123,6 +125,9 @@ void* bucketAlloc( struct BucketAlloc *ba )
 {
 	void *it;
 
+	if ( !ba )
+		return 0;
+
 	// If running out of memory, allocate new bucket and update the freelist.
 	if ( !ba->freelist || !NextFreeItem( ba ) )
 	{
@@ -139,6 +144,8 @@ void* bucketAlloc( struct BucketAlloc *ba )
 
 void bucketFree( struct BucketAlloc *ba, void *ptr )
 {
+	if ( !ba || !ptr )
+		return;
 #ifdef CHECK_BOUNDS
 	int inBounds = 0;
 	Bucket *bucket;
@@ -176,6 +183,8 @@ void bucketFree( struct BucketAlloc *ba, void *ptr )
 
 void deleteBucketAlloc( struct BucketAlloc *ba )
 {
+	if ( !ba )
+		return;
 	TESSalloc* alloc = ba->alloc;
 	Bucket *bucket = ba->buckets;
 	Bucket *next;

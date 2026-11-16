@@ -38,6 +38,7 @@
 #include "dict.h"
 #include "priorityq.h"
 #include "../Include/tesselator.h"
+#include "validate.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,6 +71,22 @@ struct TESStesselator {
 	TESSvertex *event;		/* current sweep event being processed */
 
 	struct BucketAlloc* regionPool;
+
+	/*** validated input contour cache ***/
+	TESSContour2D *contours;
+	int contourCount;
+	int contourCapacity;
+	TESSreal *contourPoints;
+	int pointCount;
+	int pointCapacity;
+	TESSreal *contourPoints3D;
+	int pointCapacity3D;
+
+	/*** validation error records ***/
+	TESSContourErrorRecord *errors;
+	int errorCount;
+	int errorCapacity;
+	int validationFailed;
 
 	TESSindex vertexIndexCounter;
 

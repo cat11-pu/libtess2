@@ -250,11 +250,41 @@ typedef enum TESSstatus {
   TESS_STATUS_INVALID_INPUT
 } TESSstatus;
 
+// Classification of the geometric problem found in an input contour. The
+// values are stable and used as the 'error' field of TESSContourErrorRecord.
+typedef enum TessContourError {
+  TESS_ERROR_INVALID_COORDINATE = 1,
+  TESS_ERROR_DUPLICATE_VERTEX = 2,
+  TESS_ERROR_COLLINEAR_SPIKE = 3,
+  TESS_ERROR_ZERO_AREA_CONTOUR = 4,
+  TESS_ERROR_SELF_INTERSECTION = 5,
+} TessContourError;
+
+// Location of a rejected contour feature. 'contour' is the zero-based index of
+// the tessAddContour() call (rejected contours still consume a call index).
+// 'vertex' is the zero-based index of the offending vertex inside that
+// contour; 'vertex2' is the other end of the offending segment, or TESS_UNDEF
+// for single-vertex errors.
+typedef struct TESSContourErrorRecord {
+  int error;
+  int contour;
+  int vertex;
+  int vertex2;
+} TESSContourErrorRecord;
+
 // Return the success or failure status. If tessTesselate fails (or will fail,
 // e.g. after invalid data is passed to tessAddContour), this can indicate
 // more specifically why. It can also be checked after tessAddContour to
 // see whether to bail out early.
 TESSstatus tessGetStatus( TESStesselator *tess );
+
+// tessGetErrorCount() - Number of contour validation errors recorded since
+// the tesselator was created (or last reset by a successful tessTesselate).
+int tessGetErrorCount( TESStesselator *tess );
+
+// tessGetErrors() - Returns pointer to the first error record, or NULL when
+// tessGetErrorCount() is zero.
+const TESSContourErrorRecord* tessGetErrors( TESStesselator *tess );
 
 #ifdef __cplusplus
 };

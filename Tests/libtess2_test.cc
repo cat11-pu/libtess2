@@ -135,11 +135,15 @@ TEST_F(Libtess2Test, EmptyPolyline) {
 }
 
 TEST_F(Libtess2Test, SingleLine) {
+  // A two-vertex contour has zero area and is now rejected with a location.
   AddPolyline(tess, {{0, 0}, {0, 1}});
-  EXPECT_NE(tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS,
+  EXPECT_EQ(tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS,
                           kNumTriangleVertices, kComponentCount, nullptr),
             0);
-  EXPECT_EQ(tessGetElementCount(tess), 0);
+  EXPECT_EQ(tessGetStatus(tess), TESS_STATUS_INVALID_INPUT);
+  ASSERT_EQ(tessGetErrorCount(tess), 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error,
+            TESS_ERROR_ZERO_AREA_CONTOUR);
 }
 
 TEST_F(Libtess2Test, SingleTriangle) {
@@ -190,9 +194,11 @@ TEST_F(Libtess2Test, FloatOverflowQuad) {
 
 TEST_F(Libtess2Test, SingularityQuad) {
   AddPolyline(tess, {{0, 0}, {0, 0}, {0, 0}, {0, 0}});
-  EXPECT_NE(tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS,
+  EXPECT_EQ(tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS,
                           kNumTriangleVertices, kComponentCount, nullptr),
             0);
+  EXPECT_EQ(tessGetStatus(tess), TESS_STATUS_INVALID_INPUT);
+  EXPECT_GT(tessGetErrorCount(tess), 0);
   EXPECT_EQ(tessGetElementCount(tess), 0);
 }
 
@@ -237,6 +243,10 @@ TEST_F(Libtess2Test, NanQuad) {
   EXPECT_EQ(tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS,
                           kNumTriangleVertices, kComponentCount, nullptr),
             0);
+  EXPECT_EQ(tessGetStatus(tess), TESS_STATUS_INVALID_INPUT);
+  ASSERT_EQ(tessGetErrorCount(tess), 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error,
+            TESS_ERROR_INVALID_COORDINATE);
   EXPECT_EQ(tessGetElementCount(tess), 0);
 }
 
@@ -307,6 +317,148 @@ TEST_F(Libtess2Test, AvoidsCrashInAddRightEdges) {
   EXPECT_EQ(tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS,
                           kNumTriangleVertices, kComponentCount, nullptr),
             0);
+}
+
+// --- Degenerate contour handling with precise error locations ---
+
+static int TesselateAndExpectRejection(TESStesselator* tess,
+                                       const std::vector<Vector2f>& polyline) {
+  AddPolyline(tess, polyline);
+  EXPECT_EQ(tessTesselate(tess, TESS_WINDING_NONZERO, TESS_POLYGONS,
+                          kNumTriangleVertices, kComponentCount, nullptr),
+            0);
+  EXPECT_EQ(tessGetStatus(tess), TESS_STATUS_INVALID_INPUT);
+  return tessGetErrorCount(tess);
+}
+
+TEST_F(Libtess2Test, RejectsSelfIntersectingBowtie) {
+  int count = TesselateAndExpectRejection(
+      tess, {{0, 0}, {1, 1}, {1, 0}, {0, 1}});
+  EXPECT_EQ(count, 2);
+  const TESSContourErrorRecord* errors = tessGetErrors(tess);
+  EXPECT_EQ(errors[0].error, TESS_ERROR_SELF_INTERSECTION);
+  EXPECT_EQ(errors[0].contour, 0);
+  EXPECT_EQ(errors[0].vertex, 0);
+  EXPECT_EQ(errors[0].vertex2, 1);
+}
+
+TEST_F(Libtess2Test, RejectsConsecutiveDuplicateWithLocation) {
+  int count = TesselateAndExpectRejection(
+      tess, {{0, 0}, {1, 0}, {1, 0}, {1, 1}, {0, 1}});
+  ASSERT_EQ(count, 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error, TESS_ERROR_DUPLICATE_VERTEX);
+  EXPECT_EQ(tessGetErrors(tess)[0].vertex, 2);
+}
+
+TEST_F(Libtess2Test, RejectsClosingDuplicateAtFirstVertex) {
+  int count = TesselateAndExpectRejection(
+      tess, {{0, 0}, {1, 0}, {1, 1}, {0, 1}, {0, 0}});
+  ASSERT_EQ(count, 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error, TESS_ERROR_DUPLICATE_VERTEX);
+  EXPECT_EQ(tessGetErrors(tess)[0].vertex, 0);
+}
+
+TEST_F(Libtess2Test, RejectsCollinearSpike) {
+  int count = TesselateAndExpectRejection(
+      tess, {{0, 0}, {2, 0}, {1, 0}, {2, 2}, {0, 2}});
+  ASSERT_EQ(count, 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error, TESS_ERROR_COLLINEAR_SPIKE);
+  EXPECT_EQ(tessGetErrors(tess)[0].vertex, 1);
+}
+
+TEST_F(Libtess2Test, AcceptsBenignCollinearMidpoint) {
+  AddPolyline(tess, {{0, 0}, {1, 0}, {2, 0}, {2, 2}, {0, 2}});
+  EXPECT_NE(tessTesselate(tess, TESS_WINDING_NONZERO, TESS_POLYGONS,
+                          kNumTriangleVertices, kComponentCount, nullptr),
+            0);
+  EXPECT_EQ(tessGetStatus(tess), TESS_STATUS_OK);
+  EXPECT_EQ(tessGetErrorCount(tess), 0);
+  EXPECT_EQ(tessGetElementCount(tess), 3);
+}
+
+TEST_F(Libtess2Test, RejectsZeroAreaHoleWithContourIndex) {
+  std::vector<Vector2f> outer = {
+      {0, 0}, {4, 0}, {4, 4}, {0, 4}};
+  std::vector<Vector2f> hole = {
+      {1, 1}, {2, 1}, {1, 1}};
+  tessAddContour(tess, kComponentCount, outer.data(),
+                 kComponentCount * sizeof(TESSreal), outer.size());
+  tessSetOption(tess, TESS_REVERSE_CONTOURS, 1);
+  tessAddContour(tess, kComponentCount, hole.data(),
+                 kComponentCount * sizeof(TESSreal), hole.size());
+  EXPECT_EQ(tessTesselate(tess, TESS_WINDING_NONZERO, TESS_POLYGONS,
+                          kNumTriangleVertices, kComponentCount, nullptr),
+            0);
+  EXPECT_EQ(tessGetStatus(tess), TESS_STATUS_INVALID_INPUT);
+  bool foundHoleError = false;
+  for (int i = 0; i < tessGetErrorCount(tess); ++i) {
+    const TESSContourErrorRecord& record = tessGetErrors(tess)[i];
+    if (record.contour == 1) foundHoleError = true;
+  }
+  EXPECT_TRUE(foundHoleError);
+}
+
+TEST_F(Libtess2Test, RejectsTJunction) {
+  int count = TesselateAndExpectRejection(
+      tess, {{0, 0}, {2, 0}, {2, 2}, {1, 0}, {0, 2}});
+  EXPECT_GE(count, 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error, TESS_ERROR_SELF_INTERSECTION);
+}
+
+TEST_F(Libtess2Test, RejectsCollinearEdgeOverlap) {
+  int count = TesselateAndExpectRejection(
+      tess, {{0, 0}, {4, 0}, {4, 4}, {1, 0}, {0, 4}});
+  EXPECT_GE(count, 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error, TESS_ERROR_SELF_INTERSECTION);
+}
+
+TEST_F(Libtess2Test, RejectsPentagram) {
+  int count = TesselateAndExpectRejection(
+      tess, {{1, 2}, {1.2245f, 1.309f}, {1.951f, 1.309f},
+             {1.363f, 0.882f}, {1.588f, 0.191f}});
+  EXPECT_GE(count, 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error, TESS_ERROR_SELF_INTERSECTION);
+}
+
+TEST_F(Libtess2Test, RejectsOutOfRangeCoordinate) {
+  int count = TesselateAndExpectRejection(
+      tess, {{0, 0}, {9e9f, 0}, {9e9f, 9e9f}});
+  ASSERT_EQ(count, 1);
+  EXPECT_EQ(tessGetErrors(tess)[0].error,
+            TESS_ERROR_INVALID_COORDINATE);
+}
+
+TEST_F(Libtess2Test, TesselatorReusableAfterSuccessfulRun) {
+  AddPolyline(tess, {{0, 0}, {1, 0}, {1, 1}, {0, 1}});
+  ASSERT_NE(tessTesselate(tess, TESS_WINDING_NONZERO, TESS_POLYGONS,
+                          kNumTriangleVertices, kComponentCount, nullptr),
+            0);
+  EXPECT_EQ(tessGetErrorCount(tess), 0);
+
+  AddPolyline(tess, {{0, 0}, {0, 1}, {1, 0}});
+  EXPECT_NE(tessTesselate(tess, TESS_WINDING_NONZERO, TESS_POLYGONS,
+                          kNumTriangleVertices, kComponentCount, nullptr),
+            0);
+  EXPECT_EQ(tessGetStatus(tess), TESS_STATUS_OK);
+  EXPECT_EQ(tessGetElementCount(tess), 1);
+}
+
+TEST_F(Libtess2Test, NoFlippedTrianglesForValidPolygonWithHole) {
+  AddPolygonWithHole(tess);
+  ASSERT_NE(tessTesselate(tess, TESS_WINDING_POSITIVE, TESS_POLYGONS,
+                          kNumTriangleVertices, kComponentCount, nullptr),
+            0);
+  const TESSindex* elements = tessGetElements(tess);
+  const TESSreal* vertices = tessGetVertices(tess);
+  for (int i = 0; i < tessGetElementCount(tess); ++i) {
+    const TESSindex* triangle = &elements[i * kNumTriangleVertices];
+    const TESSreal* a = &vertices[triangle[0] * kComponentCount];
+    const TESSreal* b = &vertices[triangle[1] * kComponentCount];
+    const TESSreal* c = &vertices[triangle[2] * kComponentCount];
+    float twiceArea = (b[0] - a[0]) * (c[1] - a[1]) -
+                      (b[1] - a[1]) * (c[0] - a[0]);
+    EXPECT_GT(twiceArea, 0.f);
+  }
 }
 
 }  // namespace

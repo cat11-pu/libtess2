@@ -38,9 +38,11 @@
 #include "mesh.h"
 #include "sweep.h"
 #include "geom.h"
+#include "validate.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define TRUE 1
 #define FALSE 0
@@ -61,6 +63,69 @@ static void Normalize( TESSreal v[3] )
 #endif
 
 #define ABS(x)	((x) < 0 ? -(x) : (x))
+
+/* Bounded growth for bookkeeping arrays. The first allocation always goes
+* through memalloc so custom allocators without memrealloc are supported.
+* Capacity doubles and is checked against an allocation cap so a hostile
+* input cannot trigger an unbounded or overflowing allocation. */
+#define TESS_MAX_ARRAY_CAPACITY (1 << 28)
+
+static int tessGrowArray( TESSalloc *alloc, void **ptr, int *capacity,
+						  unsigned int itemSize, int needed )
+{
+	void *grown;
+	int newCapacity;
+
+	if( *capacity >= needed )
+		return 1;
+	if( needed > TESS_MAX_ARRAY_CAPACITY )
+		return 0;
+
+	if( *ptr == NULL || *capacity == 0 ) {
+		newCapacity = needed < 8 ? 8 : needed;
+		grown = alloc->memalloc( alloc->userData,
+								 (unsigned int)newCapacity * itemSize );
+	} else {
+		newCapacity = *capacity;
+		while( newCapacity < needed ) {
+			if( newCapacity > TESS_MAX_ARRAY_CAPACITY / 2 ) {
+				newCapacity = TESS_MAX_ARRAY_CAPACITY;
+				break;
+			}
+			newCapacity *= 2;
+		}
+		if( !alloc->memrealloc )
+			return 0;
+		grown = alloc->memrealloc( alloc->userData, *ptr,
+								   (unsigned int)newCapacity * itemSize );
+	}
+	if( grown == NULL )
+		return 0;
+	*ptr = grown;
+	*capacity = newCapacity;
+	return 1;
+}
+
+static int RecordContourError( void *user, int error, int contour,
+							   int vertex, int vertex2 )
+{
+	TESStesselator *tess = (TESStesselator *)user;
+	TESSContourErrorRecord record;
+
+	if( !tessGrowArray( &tess->alloc, (void **)&tess->errors,
+						&tess->errorCapacity,
+						sizeof( TESSContourErrorRecord ),
+						tess->errorCount + 1 ) ) {
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
+		return 0;
+	}
+	record.error = error;
+	record.contour = contour;
+	record.vertex = vertex;
+	record.vertex2 = vertex2;
+	tess->errors[tess->errorCount++] = record;
+	return 1;
+}
 
 static int LongAxis( TESSreal v[3] )
 {
@@ -646,12 +711,32 @@ TESStesselator* tessNewTess( TESSalloc* alloc )
 		tess->alloc.regionBucketSize = 4096;
 	tess->regionPool = createBucketAlloc( &tess->alloc, "Regions",
 										 sizeof(ActiveRegion), tess->alloc.regionBucketSize );
+	if (tess->regionPool == NULL) {
+		alloc->memfree( alloc->userData, tess );
+		return NULL;
+	}
 
 	// Initialize to begin polygon.
 	tess->mesh = NULL;
 
 	tess->status = TESS_STATUS_OK;
 	tess->vertexIndexCounter = 0;
+
+	tess->dict = NULL;
+	tess->pq = NULL;
+
+	tess->contours = NULL;
+	tess->contourCount = 0;
+	tess->contourCapacity = 0;
+	tess->contourPoints = NULL;
+	tess->pointCount = 0;
+	tess->pointCapacity = 0;
+	tess->contourPoints3D = NULL;
+	tess->pointCapacity3D = 0;
+	tess->errors = NULL;
+	tess->errorCount = 0;
+	tess->errorCapacity = 0;
+	tess->validationFailed = 0;
 
 	tess->vertices = 0;
 	tess->vertexIndices = 0;
@@ -668,6 +753,28 @@ void tessDeleteTess( TESStesselator *tess )
 	struct TESSalloc alloc = tess->alloc;
 
 	deleteBucketAlloc( tess->regionPool );
+
+	if (tess->dict != NULL)
+		dictDeleteDict( &alloc, tess->dict );
+	if (tess->pq != NULL)
+		pqDeletePriorityQ( &alloc, tess->pq );
+
+	if (tess->contourPoints != NULL) {
+		alloc.memfree( alloc.userData, tess->contourPoints );
+		tess->contourPoints = NULL;
+	}
+	if (tess->contourPoints3D != NULL) {
+		alloc.memfree( alloc.userData, tess->contourPoints3D );
+		tess->contourPoints3D = NULL;
+	}
+	if (tess->contours != NULL) {
+		alloc.memfree( alloc.userData, tess->contours );
+		tess->contours = NULL;
+	}
+	if (tess->errors != NULL) {
+		alloc.memfree( alloc.userData, tess->errors );
+		tess->errors = NULL;
+	}
 
 	if( tess->mesh != NULL ) {
 		tessMeshDeleteMesh( &alloc, tess->mesh );
@@ -920,80 +1027,182 @@ void OutputContours( TESStesselator *tess, TESSmesh *mesh, int vertexSize )
 }
 
 int IsValidCoord(TESSreal coord) {
-  return coord <= TESS_MAX_VALID_INPUT_VALUE &&
-      coord >= TESS_MIN_VALID_INPUT_VALUE;
+  return tessIsValidCoord( coord );
+}
+
+/* For 3D contours pick the two axes with the largest bounding-box spans;
+* dropping the smallest span keeps 2D data (constant z) on its native x/y
+* plane. 2D contours are copied through unchanged. */
+static void ProjectContour( TESStesselator *tess, int size,
+							const unsigned char *src, int stride,
+							int numVertices, TESSreal *dst, TESSreal *dst3D )
+{
+	int drop = 2;
+	int i, axis;
+	TESSreal minVal[3], maxVal[3], span[3];
+	TESS_NOTUSED( tess );
+
+	if( size < 3 ) {
+		for( i = 0; i < numVertices; ++i ) {
+			const TESSreal *coords = (const TESSreal *)( src + (size_t)i * stride );
+			dst[i * 2] = coords[0];
+			dst[i * 2 + 1] = coords[1];
+			dst3D[i * 3] = coords[0];
+			dst3D[i * 3 + 1] = coords[1];
+			dst3D[i * 3 + 2] = 0;
+		}
+		return;
+	}
+
+	for( axis = 0; axis < 3; ++axis ) {
+		const TESSreal *first = (const TESSreal *)src;
+		minVal[axis] = maxVal[axis] = first[axis];
+	}
+	for( i = 1; i < numVertices; ++i ) {
+		const TESSreal *coords = (const TESSreal *)( src + (size_t)i * stride );
+		for( axis = 0; axis < 3; ++axis ) {
+			if( coords[axis] < minVal[axis] ) minVal[axis] = coords[axis];
+			if( coords[axis] > maxVal[axis] ) maxVal[axis] = coords[axis];
+		}
+	}
+	for( axis = 0; axis < 3; ++axis )
+		span[axis] = maxVal[axis] - minVal[axis];
+	if( span[0] <= span[drop] ) drop = 0;
+	if( span[1] <= span[drop] ) drop = 1;
+
+	for( i = 0; i < numVertices; ++i ) {
+		const TESSreal *coords = (const TESSreal *)( src + (size_t)i * stride );
+		dst3D[i * 3] = coords[0];
+		dst3D[i * 3 + 1] = coords[1];
+		dst3D[i * 3 + 2] = coords[2];
+		int out = 0;
+		for( axis = 0; axis < 3; ++axis ) {
+			if( axis == drop ) continue;
+			dst[i * 2 + out++] = coords[axis];
+		}
+	}
+}
+
+/* Builds the quad-edge mesh from the validated contour cache. Mirrors the
+* original per-vertex construction, but only runs for accepted contours. */
+static int BuildMeshFromContours( TESStesselator *tess )
+{
+	int c, i;
+
+	tess->mesh = tessMeshNewMesh( &tess->alloc );
+	if( tess->mesh == NULL )
+		return 0;
+
+	for( c = 0; c < tess->contourCount; ++c ) {
+		const TESSContour2D *contour = &tess->contours[c];
+		TESShalfEdge *e = NULL;
+
+		for( i = 0; i < contour->count; ++i ) {
+			const TESSreal *coords =
+				&tess->contourPoints3D[( contour->pointOffset + i ) * 3];
+			if( e == NULL ) {
+				e = tessMeshMakeEdge( tess->mesh );
+				if( e == NULL || !tessMeshSplice( tess->mesh, e, e->Sym ) )
+					return 0;
+			} else {
+				if( tessMeshSplitEdge( tess->mesh, e ) == NULL )
+					return 0;
+				e = e->Lnext;
+			}
+
+			e->Org->coords[0] = coords[0];
+			e->Org->coords[1] = coords[1];
+			e->Org->coords[2] = coords[2];
+			e->Org->idx = tess->vertexIndexCounter++;
+
+			e->winding = contour->reverse ? -1 : 1;
+			e->Sym->winding = contour->reverse ? 1 : -1;
+		}
+	}
+	return 1;
 }
 
 void tessAddContour( TESStesselator *tess, int size, const void* vertices,
 					int stride, int numVertices )
 {
 	const unsigned char *src = (const unsigned char*)vertices;
-	TESShalfEdge *e;
-	int i;
+	TESSContour2D contour;
 
-	if ( tess->mesh == NULL )
-	  	tess->mesh = tessMeshNewMesh( &tess->alloc );
- 	if ( tess->mesh == NULL ) {
-		tess->status = TESS_STATUS_OUT_OF_MEMORY;
+	if ( tess->status == TESS_STATUS_OUT_OF_MEMORY )
 		return;
-	}
 
 	if ( size < 2 )
 		size = 2;
 	if ( size > 3 )
 		size = 3;
 
-	e = NULL;
-	for( i = 0; i < numVertices; ++i )
-	{
-		const TESSreal* coords = (const TESSreal*)src;
-		src += stride;
-		if (!IsValidCoord(coords[0]) ||
-		    !IsValidCoord(coords[1]) ||
-		    (size > 2 && !IsValidCoord(coords[2]))) {
-			tess->status = TESS_STATUS_INVALID_INPUT;
-			return;
-		}
-		if( e == NULL ) {
-			/* Make a self-loop (one vertex, one edge). */
-			e = tessMeshMakeEdge( tess->mesh );
-			if ( e == NULL ) {
-				tess->status = TESS_STATUS_OUT_OF_MEMORY;
-				return;
-			}
-			if ( !tessMeshSplice( tess->mesh, e, e->Sym ) ) {
-				tess->status = TESS_STATUS_OUT_OF_MEMORY;
-				return;
-			}
-		} else {
-			/* Create a new vertex and edge which immediately follow e
-			* in the ordering around the left face.
-			*/
-			if ( tessMeshSplitEdge( tess->mesh, e ) == NULL ) {
-				tess->status = TESS_STATUS_OUT_OF_MEMORY;
-				return;
-			}
-			e = e->Lnext;
-		}
+	/* An empty contour keeps the historical no-op behavior (an empty
+	* tesselator still returns success with zero elements). */
+	if ( numVertices <= 0 )
+		return;
 
-		/* The new vertex is now e->Org. */
-		e->Org->coords[0] = coords[0];
-		e->Org->coords[1] = coords[1];
-		if ( size > 2 )
-			e->Org->coords[2] = coords[2];
-		else
-			e->Org->coords[2] = 0;
-		/* Store the insertion number so that the vertex can be later recognized. */
-		e->Org->idx = tess->vertexIndexCounter++;
-
-		/* The winding of an edge says how the winding number changes as we
-		* cross from the edge''s right face to its left face.  We add the
-		* vertices in such an order that a CCW contour will add +1 to
-		* the winding number of the region inside the contour.
-		*/
-        e->winding = tess->reverseContours ? -1 : 1;
-        e->Sym->winding = tess->reverseContours ? 1 : -1;
+	if ( !tessGrowArray( &tess->alloc, (void **)&tess->contourPoints,
+						&tess->pointCapacity, sizeof( TESSreal ),
+						( tess->pointCount + numVertices ) * 2 ) ||
+		!tessGrowArray( &tess->alloc, (void **)&tess->contourPoints3D,
+						&tess->pointCapacity3D, sizeof( TESSreal ),
+						( tess->pointCount + numVertices ) * 3 ) ||
+		!tessGrowArray( &tess->alloc, (void **)&tess->contours,
+						&tess->contourCapacity, sizeof( TESSContour2D ),
+						tess->contourCount + 1 ) ) {
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
+		return;
 	}
+
+	contour.pointOffset = tess->pointCount;
+	contour.count = numVertices;
+	contour.reverse = tess->reverseContours;
+	ProjectContour( tess, size, src, stride, numVertices,
+					&tess->contourPoints[tess->pointCount * 2],
+					&tess->contourPoints3D[tess->pointCount * 3] );
+	tess->pointCount += numVertices;
+	tess->contours[tess->contourCount] = contour;
+
+	if( !tessValidateContour( tess->contourPoints, &contour,
+							  tess->contourCount,
+							  RecordContourError, tess ) ) {
+		if( tess->status != TESS_STATUS_OUT_OF_MEMORY )
+			tess->status = TESS_STATUS_INVALID_INPUT;
+		tess->validationFailed = 1;
+	}
+	++tess->contourCount;
+}
+
+static void FreeInputCache( TESStesselator *tess )
+{
+	if( tess->contourPoints != NULL ) {
+		tess->alloc.memfree( tess->alloc.userData, tess->contourPoints );
+		tess->contourPoints = NULL;
+	}
+	if( tess->contourPoints3D != NULL ) {
+		tess->alloc.memfree( tess->alloc.userData, tess->contourPoints3D );
+		tess->contourPoints3D = NULL;
+	}
+	if( tess->contours != NULL ) {
+		tess->alloc.memfree( tess->alloc.userData, tess->contours );
+		tess->contours = NULL;
+	}
+	tess->contourCount = 0;
+	tess->contourCapacity = 0;
+	tess->pointCount = 0;
+	tess->pointCapacity = 0;
+	tess->pointCapacity3D = 0;
+	tess->validationFailed = 0;
+}
+
+static void FreeErrorRecords( TESStesselator *tess )
+{
+	if( tess->errors != NULL ) {
+		tess->alloc.memfree( tess->alloc.userData, tess->errors );
+		tess->errors = NULL;
+	}
+	tess->errorCount = 0;
+	tess->errorCapacity = 0;
 }
 
 void tessSetOption( TESStesselator *tess, int option, int value )
@@ -1011,10 +1220,11 @@ void tessSetOption( TESStesselator *tess, int option, int value )
 
 
 int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
-				  int polySize, int vertexSize, const TESSreal* normal )
+				  int volatile polySize, int volatile vertexSize, const TESSreal* normal )
 {
 	TESSmesh *mesh;
 	int rc = 1;
+	int i, j;
 
 	if (tess->vertices != NULL) {
 		tess->alloc.memfree( tess->alloc.userData, tess->vertices );
@@ -1045,13 +1255,48 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 	if (vertexSize > 3)
 		vertexSize = 3;
 
-	if (setjmp(tess->env) != 0) {
-		/* come back here if out of memory */
-		return 0;
+	/* Nothing was ever added: keep the historical success with no output. */
+	if( tess->contourCount == 0 && tess->errorCount == 0 ) {
+		tess->status = TESS_STATUS_OK;
+		return 1;
 	}
 
-	if (tess->status != TESS_STATUS_OK || !tess->mesh)
-	{
+	/* Cross-contour interactions only make sense once every contour has been
+	* supplied. Rejected contours still participate so their call index stays
+	* aligned with tessAddContour() ordering. */
+	if( tess->status != TESS_STATUS_OUT_OF_MEMORY ) {
+		for( i = 0; i < tess->contourCount; ++i ) {
+			for( j = i + 1; j < tess->contourCount; ++j ) {
+				if( !tessValidateContourPair(
+						tess->contourPoints,
+						&tess->contours[i], i,
+						&tess->contours[j], j,
+						RecordContourError, tess ) ) {
+					if( tess->status == TESS_STATUS_OUT_OF_MEMORY )
+						return 0;
+					tess->status = TESS_STATUS_INVALID_INPUT;
+					tess->validationFailed = 1;
+				}
+			}
+		}
+	}
+
+	if( tess->status != TESS_STATUS_OK )
+		return 0;
+
+	if( !BuildMeshFromContours( tess ) ) {
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
+		return 0;
+	}
+	if (setjmp(tess->env) != 0) {
+		/* come back here if out of memory: release every half-built sweep
+		* structure and the mesh, leaving the tesselator reusable. */
+		tessCleanupSweep( tess );
+		if( tess->mesh != NULL ) {
+			tessMeshDeleteMesh( &tess->alloc, tess->mesh );
+			tess->mesh = NULL;
+		}
+		tess->status = TESS_STATUS_OUT_OF_MEMORY;
 		return 0;
 	}
 
@@ -1094,9 +1339,19 @@ int tessTesselate( TESStesselator *tess, int windingRule, int elementType,
 	{
 		OutputPolymesh( tess, mesh, elementType, polySize, vertexSize );     /* output polygons */
 	}
+	if( tess->status != TESS_STATUS_OK )
+		longjmp( tess->env, 1 );
 
 	tessMeshDeleteMesh( &tess->alloc, mesh );
 	tess->mesh = NULL;
+
+	if( tess->status == TESS_STATUS_OK ) {
+		/* The cached inputs were consumed; reset so the object can accept a
+		* fresh polygon on the next run. */
+		FreeInputCache( tess );
+		FreeErrorRecords( tess );
+		tess->vertexIndexCounter = 0;
+	}
 
 	return tess->status == TESS_STATUS_OK;
 }
@@ -1131,3 +1386,12 @@ TESSstatus tessGetStatus( TESStesselator *tess )
 	return tess->status;
 }
 
+int tessGetErrorCount( TESStesselator *tess )
+{
+	return tess->errorCount;
+}
+
+const TESSContourErrorRecord* tessGetErrors( TESStesselator *tess )
+{
+	return tess->errors;
+}

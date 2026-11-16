@@ -42,6 +42,10 @@
 */
 int tessComputeInterior( TESStesselator *tess );
 
+/* Idempotently releases the edge dictionary and priority queue when a sweep
+* is aborted via longjmp. Safe to call when either pointer is already NULL. */
+void tessCleanupSweep( TESStesselator *tess );
+
 
 /* The following is here *only* for access by debugging routines */
 

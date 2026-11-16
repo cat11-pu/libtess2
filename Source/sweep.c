@@ -1166,6 +1166,7 @@ static void DoneEdgeDict( TESStesselator *tess )
 		/*    tessMeshDelete( reg->eUp );*/
 	}
 	dictDeleteDict( &tess->alloc, tess->dict );
+	tess->dict = NULL;
 }
 
 
@@ -1242,6 +1243,7 @@ static int InitPriorityQ( TESStesselator *tess )
 static void DonePriorityQ( TESStesselator *tess )
 {
 	pqDeletePriorityQ( &tess->alloc, tess->pq );
+	tess->pq = NULL;
 }
 
 
@@ -1335,4 +1337,16 @@ int tessComputeInterior( TESStesselator *tess )
 	tessMeshCheckMesh( tess->mesh );
 
 	return 1;
+}
+
+void tessCleanupSweep( TESStesselator *tess )
+{
+	if( tess->dict != NULL ) {
+		dictDeleteDict( &tess->alloc, tess->dict );
+		tess->dict = NULL;
+	}
+	if( tess->pq != NULL ) {
+		pqDeletePriorityQ( &tess->alloc, tess->pq );
+		tess->pq = NULL;
+	}
 }
